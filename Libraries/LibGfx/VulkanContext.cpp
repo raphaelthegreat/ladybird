@@ -63,8 +63,10 @@ static ErrorOr<VkPhysicalDevice> pick_physical_device(VkInstance instance)
 
         VkPhysicalDeviceProperties device_properties;
         vkGetPhysicalDeviceProperties(device, &device_properties);
-        if (device_properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
+        if (device_properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+            dbgln("{}\n", device_properties.deviceName);
             picked_device = device;
+        }
     }
 
     if (picked_device != VK_NULL_HANDLE)
@@ -101,10 +103,11 @@ static ErrorOr<VkDevice> create_logical_device(VkPhysicalDevice physical_device)
 
     VkPhysicalDeviceFeatures deviceFeatures {};
 
-    Array<char const*, 3> device_extensions = {
+    Array<char const*, 4> device_extensions = {
         VK_KHR_SWAPCHAIN_EXTENSION_NAME,
         VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
         VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
+        VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME,
     };
 
     VkDeviceCreateInfo create_device_info {};
@@ -124,7 +127,7 @@ static ErrorOr<VkDevice> create_logical_device(VkPhysicalDevice physical_device)
 
 ErrorOr<NonnullRefPtr<VulkanContext>> create_vulkan_context()
 {
-    uint32_t const api_version = VK_API_VERSION_1_0;
+    uint32_t const api_version = VK_API_VERSION_1_3;
     auto* instance = TRY(create_instance(api_version));
     auto* physical_device = TRY(pick_physical_device(instance));
     auto* logical_device = TRY(create_logical_device(physical_device));
@@ -174,6 +177,8 @@ static ErrorOr<int> export_memory_to_dmabuf(VkDevice device, VkDeviceMemory memo
     return dma_buf_fd;
 }
 
+using GetImageDrmFormatModifierPropertiesEXT = VkResult(*)(VkDevice, VkImage, VkImageDrmFormatModifierPropertiesEXT*);
+
 ErrorOr<Image> create_image(VulkanContext& context, VkExtent2D extent, VkFormat format)
 {
     VkImageCreateInfo image_create_info {};
@@ -184,19 +189,66 @@ ErrorOr<Image> create_image(VulkanContext& context, VkExtent2D extent, VkFormat 
     image_create_info.mipLevels = 1;
     image_create_info.arrayLayers = 1;
     image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
-    image_create_info.tiling = VK_IMAGE_TILING_LINEAR;
-    image_create_info.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
-    ;
-    image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    image_create_info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    image_create_info.sharingMode = VK_SHARING_MODE_CONCURRENT;
     image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+
+    VkDrmFormatModifierPropertiesListEXT mod_list {};
+    mod_list.sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT;
+    mod_list.pNext = nullptr;
+    mod_list.pDrmFormatModifierProperties = nullptr;
+
+    VkFormatProperties2 props;
+    props.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2;
+    props.pNext = &mod_list;
+
+    //for (int i = 0; i < 184; i++) {
+        vkGetPhysicalDeviceFormatProperties2(context.physical_device, format, &props);
+        //if (mod_list.drmFormatModifierCount != 0) {
+            dbgln("Num DRM modifiers {} format {}\n", mod_list.drmFormatModifierCount, int(format));
+        //}
+        //mod_list.drmFormatModifierCount = 0;
+    //}
+
+    Vector<VkDrmFormatModifierPropertiesEXT> mod_array;
+    mod_array.resize(mod_list.drmFormatModifierCount);
+    mod_list.pDrmFormatModifierProperties = mod_array.data();
+    vkGetPhysicalDeviceFormatProperties2(context.physical_device, format, &props);
+
+    VkImageDrmFormatModifierListCreateInfoEXT modifier_list {};
+    modifier_list.sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT;
+    modifier_list.pNext = nullptr;
+    modifier_list.drmFormatModifierCount = mod_list.drmFormatModifierCount;
+
+    Vector<uint64_t> modifiers;
+    modifiers.resize(mod_list.drmFormatModifierCount);
+    for (uint32_t i = 0; i < mod_list.drmFormatModifierCount; i++) {
+        modifiers[i] = mod_list.pDrmFormatModifierProperties[i].drmFormatModifier;
+    }
+    modifier_list.pDrmFormatModifiers = modifiers.data();
 
     VkExternalMemoryImageCreateInfo external_memory_image_create_info {};
     external_memory_image_create_info.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
+    external_memory_image_create_info.pNext = &modifier_list;
     external_memory_image_create_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
     image_create_info.pNext = &external_memory_image_create_info;
 
     VkImage image = VK_NULL_HANDLE;
-    if (vkCreateImage(context.logical_device, &image_create_info, nullptr, &image) != VK_SUCCESS) {
+    if (int error = vkCreateImage(context.logical_device, &image_create_info, nullptr, &image); error != VK_SUCCESS) {
+        dbgln("Img error = {}\n", error);
+        return Error::from_string_literal("Image creation failed");
+    }
+
+    GetImageDrmFormatModifierPropertiesEXT get_drm_properties;
+    get_drm_properties = (GetImageDrmFormatModifierPropertiesEXT)vkGetDeviceProcAddr(context.logical_device, "vkGetImageDrmFormatModifierPropertiesEXT");
+
+    VkImageDrmFormatModifierPropertiesEXT mod_props;
+    mod_props.sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT;
+    mod_props.pNext = nullptr;
+    if (int error = get_drm_properties(context.logical_device, image, &mod_props); error != VK_SUCCESS) {
+        dbgln("DRM error = {}\n", error);
         return Error::from_string_literal("Image creation failed");
     }
 
@@ -236,7 +288,8 @@ ErrorOr<Image> create_image(VulkanContext& context, VkExtent2D extent, VkFormat 
         .memory = image_memory,
         .alloc_size = memory_requirements.size,
         .create_info = image_create_info_copy,
-        .exported_fd = exported_fd
+        .exported_fd = exported_fd,
+        .modifier = mod_props.drmFormatModifier,
     };
 }
 

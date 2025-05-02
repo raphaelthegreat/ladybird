@@ -91,6 +91,13 @@ NonnullRefPtr<PaintingSurface> PaintingSurface::wrap_iosurface(Core::IOSurfaceHa
 #else
 NonnullRefPtr<PaintingSurface> PaintingSurface::wrap_vkimage(Vulkan::Image image, RefPtr<SkiaBackendContext> context, Origin origin)
 {
+    VkImageSubresource subres;
+    subres.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    subres.mipLevel = 0;
+    subres.arrayLayer = 0;
+    VkSubresourceLayout layout;
+    vkGetImageSubresourceLayout(image.device, image.image, &subres, &layout);
+
     auto image_info = SkImageInfo::Make(image.create_info.extent.width, image.create_info.extent.height, kBGRA_8888_SkColorType, kPremul_SkAlphaType, SkColorSpace::MakeSRGB());
     GrVkImageInfo vk_info = {};
     vk_info.fCurrentQueueFamily = VK_QUEUE_FAMILY_IGNORED;
@@ -100,19 +107,20 @@ NonnullRefPtr<PaintingSurface> PaintingSurface::wrap_vkimage(Vulkan::Image image
     vk_info.fImageTiling = image.create_info.tiling;
     vk_info.fImageUsageFlags = image.create_info.usage;
     vk_info.fSharingMode = image.create_info.sharingMode;
+    vk_info.fAlloc = skgpu::VulkanAlloc();
     vk_info.fAlloc.fMemory = image.memory;
-    vk_info.fAlloc.fOffset = 0;
-    vk_info.fAlloc.fSize = image.alloc_size;
+    vk_info.fAlloc.fOffset = layout.offset;
+    vk_info.fAlloc.fSize = layout.size;
     vk_info.fAlloc.fFlags = 0;
     vk_info.fAlloc.fBackendMemory = 0;
     vk_info.fProtected = skgpu::Protected::kNo;
     vk_info.fSampleCount = 1;
-    vk_info.fLevelCount = 0;
+    vk_info.fLevelCount = 1;
 
     auto backend_render_target = GrBackendRenderTargets::MakeVk(image_info.height(), image_info.height(), vk_info);
     GrSurfaceOrigin sk_origin = origin == Origin::TopLeft ? kTopLeft_GrSurfaceOrigin : kBottomLeft_GrSurfaceOrigin;
-    auto surface = SkSurfaces::WrapBackendRenderTarget(context->sk_context(), backend_render_target, sk_origin, kBGRA_8888_SkColorType, nullptr, nullptr);
-    return adopt_ref(*new PaintingSurface(make<Impl>(IntSize { image.create_info.extent.width, image.create_info.extent.height }, surface, nullptr, context)));
+    auto surface = SkSurfaces::WrapBackendRenderTarget(context->sk_context(), backend_render_target, sk_origin, kRGBA_8888_SkColorType, nullptr, nullptr);
+    return adopt_ref(*new PaintingSurface(make<Impl>(context, IntSize { image.create_info.extent.width, image.create_info.extent.height }, surface, nullptr)));
 }
 #endif
 

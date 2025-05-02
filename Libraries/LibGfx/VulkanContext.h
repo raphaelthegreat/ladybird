@@ -42,6 +42,7 @@ struct Image {
     VkDeviceSize alloc_size { 0 };
     VkImageCreateInfo create_info {};
     int exported_fd = { -1 };
+    uint64_t modifier = { 0ULL };
 };
 
 ErrorOr<Image> create_image(VulkanContext&, VkExtent2D, VkFormat);

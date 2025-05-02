@@ -13,7 +13,6 @@
 #include <LibGfx/PaintingSurface.h>
 #include <LibWeb/WebGL/OpenGLContext.h>
 
-#ifdef AK_OS_MACOS
 #    include <EGL/egl.h>
 #    include <EGL/eglext.h>
 #    include <EGL/eglext_angle.h>
@@ -23,6 +22,9 @@
 extern "C" {
 #    include <GLES2/gl2ext_angle.h>
 }
+
+#ifdef USE_VULKAN
+#    include <libdrm/drm_fourcc.h>
 #endif
 
 namespace Web::WebGL {
@@ -35,6 +37,7 @@ struct OpenGLContext::Impl {
 
     GLuint framebuffer { 0 };
     GLuint depth_buffer { 0 };
+    GLuint color_buffer { 0 };
 };
 
 OpenGLContext::OpenGLContext(NonnullRefPtr<Gfx::SkiaBackendContext> skia_backend_context, Impl impl)
@@ -118,7 +121,7 @@ OwnPtr<OpenGLContext> OpenGLContext::create(NonnullRefPtr<Gfx::SkiaBackendContex
 
     EGLint context_attributes[] = {
         EGL_CONTEXT_CLIENT_VERSION,
-        2,
+        3,
         EGL_CONTEXT_WEBGL_COMPATIBILITY_ANGLE,
         EGL_TRUE,
         EGL_NONE,
@@ -168,6 +171,11 @@ void OpenGLContext::clear_buffer_to_default_values()
 #endif
 }
 
+using Func = VkResult(*)(
+    VkDevice                                    device,
+    VkImage                                     image,
+    VkImageDrmFormatModifierPropertiesEXT*      pProperties);
+
 void OpenGLContext::allocate_painting_surface_if_needed()
 {
     if (m_painting_surface)
@@ -180,26 +188,29 @@ void OpenGLContext::allocate_painting_surface_if_needed()
     m_painting_surface = Gfx::PaintingSurface::wrap_iosurface(iosurface, m_skia_backend_context, Gfx::PaintingSurface::Origin::BottomLeft);
 #else
     VkExtent2D const extent { static_cast<uint32_t>(m_size.width()), static_cast<uint32_t>(m_size.height()) };
-    auto vulkan_image_or_error = Gfx::Vulkan::create_image(m_skia_backend_context->vulkan_context(), extent, VK_FORMAT_B8G8R8A8_UNORM);
+    auto& context = m_skia_backend_context->vulkan_context();
+    auto vulkan_image_or_error = Gfx::Vulkan::create_image(context, extent, VK_FORMAT_R8G8B8A8_UNORM);
     if (vulkan_image_or_error.is_error()) {
         dbgln("Failed to create Vulkan image: {}", vulkan_image_or_error.error());
         VERIFY_NOT_REACHED();
     }
     auto vulkan_image = vulkan_image_or_error.release_value();
+    VERIFY(vulkan_image.modifier != ~0ULL);
+    dbgln("Vulkan image drm modifier: {}", vulkan_image.modifier);
 #endif
 
     auto width = m_size.width();
     auto height = m_size.height();
 
-    auto* display = m_impl->display;
-    auto* config = m_impl->config;
+    [[maybe_unused]] auto* display = m_impl->display;
+    [[maybe_unused]] auto* config = m_impl->config;
 
 #ifdef AK_OS_MACOS
     EGLint target = 0;
     eglGetConfigAttrib(display, config, EGL_BIND_TO_TEXTURE_TARGET_ANGLE, &target);
 #endif
 
-    EGLint const surface_attributes[] = {
+    [[maybe_unused]] EGLint const surface_attributes[] = {
         EGL_WIDTH,
         width,
         EGL_HEIGHT,
@@ -226,63 +237,57 @@ void OpenGLContext::allocate_painting_surface_if_needed()
     int dma_buf_fd = vulkan_image.exported_fd;
     dbgln("Exported dma_buf fd: {}", dma_buf_fd);
 
-    ScopeGuard close_dma_buf_fd = [&] { ::close(dma_buf_fd); };
+    VkImageSubresource subres;
+    subres.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    subres.mipLevel = 0;
+    subres.arrayLayer = 0;
+    VkSubresourceLayout layout;
+    vkGetImageSubresourceLayout(vulkan_image.device, vulkan_image.image, &subres, &layout);
 
     EGLint image_attribs[] = {
         EGL_WIDTH, width,
         EGL_HEIGHT, height,
-        EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_ARGB8888,
+        EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_ABGR8888,
         EGL_DMA_BUF_PLANE0_FD_EXT, dma_buf_fd,
-        EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
-        EGL_DMA_BUF_PLANE0_PITCH_EXT, width * 4,
+        EGL_DMA_BUF_PLANE0_OFFSET_EXT, int(layout.offset),
+        EGL_DMA_BUF_PLANE0_PITCH_EXT, int(layout.rowPitch),
+        EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, int(vulkan_image.modifier),
+        EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, int(vulkan_image.modifier >> 32),
         EGL_NONE
     };
     EGLImageKHR egl_image = eglCreateImageKHR(m_impl->display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, image_attribs);
     VERIFY(egl_image != EGL_NO_IMAGE_KHR);
 
-    m_impl->surface = eglCreatePbufferFromClientBuffer(m_impl->display, EGL_LINUX_DMA_BUF_EXT, egl_image, config, surface_attributes);
-
     m_painting_surface = Gfx::PaintingSurface::wrap_vkimage(vulkan_image, m_skia_backend_context, Gfx::PaintingSurface::Origin::BottomLeft);
 #endif
-
-    if (m_impl->surface == EGL_NO_SURFACE) {
-        dbgln("Failed to create EGL surface: {:x}", eglGetError());
-        VERIFY_NOT_REACHED();
-    }
-
-    eglMakeCurrent(m_impl->display, m_impl->surface, m_impl->surface, m_impl->context);
+    
+    // Create surface-less context
+    eglMakeCurrent(m_impl->display, EGL_NO_SURFACE, EGL_NO_SURFACE, m_impl->context);
 
     // This extension is not enabled by default in WebGL compatibility mode, so we need to request it.
     glRequestExtensionANGLE("GL_ANGLE_texture_rectangle");
+    glRequestExtensionANGLE("GL_OES_EGL_image_external");
+    glRequestExtensionANGLE("GL_OES_EGL_image");
+    glRequestExtensionANGLE("GL_OES_rgb8_rgba8");
 
-#ifdef AK_OS_MACOS
-    EGLint texture_target_angle = 0;
-    eglGetConfigAttrib(display, config, EGL_BIND_TO_TEXTURE_TARGET_ANGLE, &texture_target_angle);
-    VERIFY(texture_target_angle == EGL_TEXTURE_RECTANGLE_ANGLE);
-#else
-    texture_target_angle = GL_TEXTURE_2D;
-#endif
+    // Allocate color buffer
+    glGenRenderbuffers(1, &m_impl->color_buffer);
+    glBindRenderbuffer(GL_RENDERBUFFER, m_impl->color_buffer);
+    glEGLImageTargetRenderbufferStorageOES(GL_RENDERBUFFER, egl_image);
 
-    GLuint texture = 0;
-    glGenTextures(1, &texture);
-    glBindTexture(texture_target, texture);
-
-    auto result = eglBindTexImage(display, m_impl->surface, EGL_BACK_BUFFER);
-    if (result == EGL_FALSE) {
-        dbgln("Failed to bind texture image to EGL surface: {:x}", eglGetError());
-        VERIFY_NOT_REACHED();
-    }
-
-    glGenFramebuffers(1, &m_impl->framebuffer);
-    glBindFramebuffer(GL_FRAMEBUFFER, m_impl->framebuffer);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, texture_target, texture, 0);
-
-    // NOTE: ANGLE doesn't allocate depth buffer for us, so we need to do it manually
-    // FIXME: Depth buffer only needs to be allocated if it's configured in WebGL context attributes
+    // Allocate depth buffer
     glGenRenderbuffers(1, &m_impl->depth_buffer);
     glBindRenderbuffer(GL_RENDERBUFFER, m_impl->depth_buffer);
     glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT16, width, height);
+
+    // Create framebuffer
+    glGenFramebuffers(1, &m_impl->framebuffer);
+    glBindFramebuffer(GL_FRAMEBUFFER, m_impl->framebuffer);
     glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, m_impl->depth_buffer);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, m_impl->color_buffer);
+
+    glClearColor(0.0f, 0.0f, 0.0f, 1.f);
+    glClear(GL_COLOR_BUFFER_BIT);
 }
 
 void OpenGLContext::set_size(Gfx::IntSize const& size)
